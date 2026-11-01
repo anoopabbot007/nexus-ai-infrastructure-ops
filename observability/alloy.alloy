@@ -1,0 +1,21 @@
+local.file_match "nexus_demo" {
+  path_targets = [
+    {
+      "__path__" = "/var/log/nexus/*.jsonl",
+      "job" = "nexus-demo",
+    },
+  ]
+  sync_period = "2s"
+}
+
+loki.source.file "nexus_demo" {
+  targets    = local.file_match.nexus_demo.targets
+  forward_to = [loki.write.local.receiver]
+  tail_from_end = false
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

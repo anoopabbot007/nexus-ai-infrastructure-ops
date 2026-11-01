@@ -1,0 +1,194 @@
+services:
+  database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nexus}
+      POSTGRES_USER: ${POSTGRES_USER:-nexus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus-local-only}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - nexus-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  demo-telemetry:
+    build: ./agent-service
+    command: ["uvicorn", "agent_service.demo_telemetry:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      DEMO_SERVICE_NAME: ${DEMO_SERVICE_NAME:-payment-service}
+      DEMO_ENVIRONMENT: ${DEMO_ENVIRONMENT:-production}
+      DEMO_MEMORY_BUDGET_MB: ${DEMO_MEMORY_BUDGET_MB:-64}
+      NEXUS_LOG_FILE: /var/log/nexus/demo.jsonl
+    ports: ["${DEMO_TELEMETRY_PORT:-8002}:8002"]
+    volumes:
+      - nexus-demo-logs:/var/log/nexus
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+      - --storage.tsdb.retention.time=7d
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - nexus-prometheus-data:/prometheus
+    depends_on:
+      demo-telemetry:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 8
+      start_period: 15s
+
+  loki:
+    image: grafana/loki:3.7.9
+    command: ["-config.file=/etc/loki/loki.yml", "-target=all"]
+    ports: ["${LOKI_PORT:-3100}:3100"]
+    volumes:
+      - ./observability/loki.yml:/etc/loki/loki.yml:ro
+      - nexus-loki-data:/loki
+    healthcheck:
+      # The upstream Loki image is distroless and has no /bin/sh, wget or curl.
+      # Verify its executable here; the live integration checks HTTP /ready.
+      test: ["CMD", "/usr/bin/loki", "-version"]
+      interval: 10s
+      timeout: 4s
+      retries: 10
+      start_period: 20s
+
+  alloy:
+    image: grafana/alloy:v1.21.3
+    command: ["run", "--storage.path=/var/lib/alloy/data", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+    ports: ["127.0.0.1:${ALLOY_PORT:-12345}:12345"]
+    volumes:
+      - ./observability/alloy.alloy:/etc/alloy/config.alloy:ro
+      - nexus-demo-logs:/var/log/nexus:ro
+      - nexus-alloy-data:/var/lib/alloy/data
+    depends_on:
+      loki:
+        condition: service_healthy
+      demo-telemetry:
+        condition: service_healthy
+    healthcheck:
+      # The upstream image has no wget; check the Alloy process here. Its HTTP
+      # /-/ready endpoint is verified separately by the live stack test.
+      test: ["CMD", "/bin/alloy", "--version"]
+      interval: 10s
+      timeout: 3s
+      retries: 8
+      start_period: 15s
+
+  mcp-server:
+    build: ./agent-service
+    command: ["python", "-m", "agent_service.mcp.server"]
+    environment:
+      TELEMETRY_MODE: ${TELEMETRY_MODE:-real}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      LOKI_URL: ${LOKI_URL:-http://loki:3100}
+      INVESTIGATION_LOOKBACK_MINUTES: ${INVESTIGATION_LOOKBACK_MINUTES:-15}
+      MAX_LOG_RESULTS: ${MAX_LOG_RESULTS:-100}
+      QUERY_STEP_SECONDS: ${QUERY_STEP_SECONDS:-30}
+      TELEMETRY_HTTP_TIMEOUT_SECONDS: ${TELEMETRY_HTTP_TIMEOUT_SECONDS:-8}
+    ports: ["127.0.0.1:${MCP_PORT:-8001}:8001"]
+    depends_on:
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8001),timeout=2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+
+  agent-service:
+    build: ./agent-service
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-10-21}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-15}
+      WORKFLOW_TIMEOUT_SECONDS: ${WORKFLOW_TIMEOUT_SECONDS:-120}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      TELEMETRY_MODE: ${TELEMETRY_MODE:-real}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      LOKI_URL: ${LOKI_URL:-http://loki:3100}
+      MCP_SERVER_URL: ${MCP_SERVER_URL:-http://mcp-server:8001/mcp}
+      INVESTIGATION_LOOKBACK_MINUTES: ${INVESTIGATION_LOOKBACK_MINUTES:-15}
+      MAX_LOG_RESULTS: ${MAX_LOG_RESULTS:-100}
+      QUERY_STEP_SECONDS: ${QUERY_STEP_SECONDS:-30}
+      TELEMETRY_HTTP_TIMEOUT_SECONDS: ${TELEMETRY_HTTP_TIMEOUT_SECONDS:-8}
+      MCP_TIMEOUT_SECONDS: ${MCP_TIMEOUT_SECONDS:-20}
+    ports: ["127.0.0.1:${AGENT_SERVICE_PORT:-8000}:8000"]
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: jdbc:postgresql://database:5432/${POSTGRES_DB:-nexus}
+      DATABASE_USER: ${POSTGRES_USER:-nexus}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-nexus-local-only}
+      AGENT_SERVICE_URL: http://agent-service:8000
+      AGENT_TIMEOUT_MS: ${AGENT_TIMEOUT_MS:-130000}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3000}
+    ports: ["${BACKEND_PORT:-8080}:8080"]
+    depends_on:
+      database:
+        condition: service_healthy
+      agent-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 4s
+      retries: 8
+      start_period: 45s
+
+  frontend:
+    build: ./frontend
+    ports: ["${FRONTEND_PORT:-3000}:80"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  nexus-postgres-data:
+  nexus-prometheus-data:
+  nexus-loki-data:
+  nexus-alloy-data:
+  nexus-demo-logs:
